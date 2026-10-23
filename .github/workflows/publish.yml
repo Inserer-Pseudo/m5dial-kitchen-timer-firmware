@@ -1,0 +1,464 @@
+# Publish (ADR-13, ADR-14): build a release of the private repository from a commit of its main
+# branch, sign it after a manual approval, publish it here and, for a final tag, deploy the web
+# installer.
+#
+# Started by the private repository's release.yml on a v* tag (gh workflow run, token limited to
+# Actions on this repository), or by hand: Actions > Publish > Run workflow, tag = vX.Y.Z or
+# vX.Y.Z-rc.N (optional min_version).
+#
+#   build    environment `source` (main only, no reviewer): SOURCE_READ_TOKEN, Contents: read on the
+#            private repository. Resolves the tag to a commit there, refuses a commit that is not on
+#            its main branch, checks it out at that SHA, builds the release flavour in the ESP-IDF
+#            image pinned by digest (no cache), runs check_release.py (tag = built version,
+#            CHANGELOG) and uploads the binaries only (never the ELF, the map or any source). Its
+#            summary is what the approver reads: tag, commit, subject, version, size, SHA-256.
+#   sign     environment `release` (manual approval, main only): SIGNING_KEY_PEM only. Checks out
+#            THIS repository only (public key, hash-pinned requirements), checks that the artifact
+#            is the one build measured, signs with the pinned espsecure and verifies with
+#            keys/signing_pubkey.pem. Runs no code from the private repository and no repository
+#            script: pinned espsecure and shell only.
+#   publish  contents: write. Verifies the signature again and that the signed image is the
+#            measured unsigned one plus its signature sector, generates the manifests with the
+#            vendored tools/ (reviewed here through the main ruleset), creates the release
+#            (latest for vX.Y.Z, pre-release for -rc.N).
+#   pages    final tags only: verifies the installer's app part (signature, SHA-256 = release
+#            asset) and deploys the web installer.
+#
+# Hardening: default permissions none, each job asks for what it needs; every action pinned by full
+# commit SHA, the build image by digest; inputs validated first and only ever used through
+# environment variables (never ${{ }} inside a script); checkouts never persist credentials; no
+# secret is printed; no pull_request_target anywhere in this repository.
+#
+# The logs, summaries and artifacts of this public repository are public: the build log is plain
+# idf.py output (file names, no source: the firmware builds with -Werror, so a tagged commit prints no
+# warning), the artifacts hold binaries only. Public repositories do not consume Actions minutes.
+name: Publish
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag of the private repository (vX.Y.Z or vX.Y.Z-rc.N)"
+        required: true
+        type: string
+      min_version:
+        description: "Optional: oldest running version allowed to install this one (vX.Y.Z)"
+        required: false
+        type: string
+        default: ""
+
+concurrency:
+  group: publish
+  cancel-in-progress: false
+
+permissions: {}
+
+env:
+  SOURCE_REPO: Inserer-Pseudo/m5dial-kitchen-timer
+  APP_ID: timer                       # manifest "app" of the default build (APP=timer)
+  TAG: ${{ inputs.tag }}              # validated by the first step of every job that uses it
+  MIN_VERSION: ${{ inputs.min_version }}
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    environment: source
+    permissions: {}   # the private checkout uses SOURCE_READ_TOKEN; artifacts use the runtime token
+    # espressif/idf:v6.1 (pushed 2026-08-26), multi-arch index digest resolved on 2026-10-23 from
+    # registry-1.docker.io (amd64 manifest sha256:f81b6e077e6af93c312181cd7d4e7936cfbafc5c7f77cbacba8fdd34994f218a).
+    # Update procedure: MAINTAINERS.md.
+    container: espressif/idf@sha256:81893c71bb5e570088901f21def8684c25cd2a9020281bd01b843a7655edb18c
+    outputs:
+      final: ${{ steps.validate.outputs.final }}
+      commit: ${{ steps.source.outputs.sha }}
+      unsigned_sha256: ${{ steps.measure.outputs.sha256 }}
+    env:
+      IDF_TARGET: esp32s3
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Validate the inputs
+        id: validate
+        run: |
+          # [[ =~ ]] anchors on the whole string: no newline or shell metacharacter can get through.
+          if ! [[ "$TAG" =~ ^v[0-9]{1,5}\.[0-9]{1,5}\.[0-9]{1,5}(-rc\.[0-9]{1,5})?$ ]]; then
+            echo "::error::tag must be vX.Y.Z or vX.Y.Z-rc.N"
+            exit 1
+          fi
+          if [ -n "$MIN_VERSION" ] && ! [[ "$MIN_VERSION" =~ ^v[0-9]{1,5}\.[0-9]{1,5}\.[0-9]{1,5}$ ]]; then
+            echo "::error::min_version must be empty or vX.Y.Z"
+            exit 1
+          fi
+          if [[ "$TAG" == *-rc.* ]]; then final=false; else final=true; fi
+          echo "final=$final" >> "$GITHUB_OUTPUT"
+          echo "Building $TAG (final: $final)"
+
+      - name: Resolve the tag to a commit of the private main branch
+        id: source
+        env:
+          GH_TOKEN: ${{ secrets.SOURCE_READ_TOKEN }}
+        run: |
+          # Only fields are extracted and printed: API answers (commit messages, file lists) of the
+          # private repository never reach this public log.
+          api() {
+            curl -fsS --retry 3 --max-time 30 -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" -H "X-GitHub-Api-Version: 2022-11-28" \
+              "https://api.github.com/repos/$SOURCE_REPO/$1"
+          }
+          field() {  # <python expression on j>
+            python3 -c 'import json, sys; j = json.load(sys.stdin); print(eval(sys.argv[1]))' "$1"
+          }
+          obj=$(api "git/ref/tags/$TAG") || { echo "::error::tag $TAG not found in the private repository"; exit 1; }
+          type=$(field 'j["object"]["type"]' <<< "$obj")
+          sha=$(field 'j["object"]["sha"]' <<< "$obj")
+          # An annotated tag points to a tag object: follow it (a tag of a tag too) to the commit.
+          for _ in 1 2 3 4; do
+            [ "$type" = tag ] || break
+            obj=$(api "git/tags/$sha")
+            type=$(field 'j["object"]["type"]' <<< "$obj")
+            sha=$(field 'j["object"]["sha"]' <<< "$obj")
+          done
+          if [ "$type" != commit ] || ! [[ "$sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::tag $TAG does not resolve to a commit"
+            exit 1
+          fi
+          # main...sha is "behind" (or "identical") exactly when the commit is an ancestor of main:
+          # a tag on a branch, or on a commit that never reached main, is refused.
+          cmp=$(api "compare/main...$sha?per_page=1")
+          status=$(field 'j["status"]' <<< "$cmp")
+          ahead=$(field 'j["ahead_by"]' <<< "$cmp")
+          if [ "$status" != behind ] && [ "$status" != identical ] || [ "$ahead" != 0 ]; then
+            echo "::error::commit $sha of $TAG is not on the private main branch (compare: $status, ahead by $ahead)"
+            exit 1
+          fi
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "$TAG -> $sha, on main ($status)"
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ steps.source.outputs.sha }}
+          token: ${{ secrets.SOURCE_READ_TOKEN }}
+          fetch-depth: 0               # tags and history: git describe -> PROJECT_VER, which must equal the tag
+          persist-credentials: false   # the token is not left in .git/config for the build
+
+      - name: Environment
+        env:
+          COMMIT: ${{ steps.source.outputs.sha }}
+        run: |
+          # The workspace belongs to the runner user, the container runs as root: let git describe work.
+          git config --global --add safe.directory '*'
+          test "$(git rev-parse HEAD)" = "$COMMIT"
+
+      - name: Tag and changelog (fail before building)
+        run: python3 tools/release/check_release.py --tag "$TAG" --notes-out /dev/null
+
+      - name: Build the release flavour (unsigned, no cache)
+        run: |
+          . "$IDF_PATH/export.sh" > /dev/null
+          idf.py -B build-release -D SDKCONFIG=build-release/sdkconfig \
+            -D "SDKCONFIG_DEFAULTS=sdkconfig.defaults;sdkconfig.defaults.release" build
+          # Release gates (same as the private ci.yml): verification of signed updates, USB kept alive
+          # on a PC, no sysmon, and the 2.4 MB budget (SPEC L3).
+          h=build-release/config/sdkconfig.h
+          for opt in CONFIG_SECURE_SIGNED_APPS_NO_SECURE_BOOT CONFIG_SECURE_SIGNED_ON_UPDATE_NO_SECURE_BOOT \
+                     CONFIG_USJ_NO_AUTO_LS_ON_CONNECTION; do
+            grep -q "#define $opt " "$h" || { echo "::error::$opt missing from the release build"; exit 1; }
+          done
+          if grep -q "#define CONFIG_LV_USE_SYSMON " "$h"; then echo "::error::sysmon in the release build"; exit 1; fi
+          size=$(stat -c %s build-release/m5dial_kitchen_timer.bin)
+          echo "release image: $size bytes"
+          test "$size" -le 2516582
+
+      - name: Tag = built version (no -dirty), release notes from CHANGELOG.md
+        run: |
+          mkdir -p dist
+          python3 tools/release/check_release.py --tag "$TAG" --build-dir build-release --notes-out dist/notes.md
+
+      - name: Collect the binaries (no ELF, no map, no source)
+        id: measure
+        env:
+          COMMIT: ${{ steps.source.outputs.sha }}
+        run: |
+          app="dist/m5dial-kitchen-timer-$APP_ID-$TAG-unsigned.bin"
+          cp build-release/m5dial_kitchen_timer.bin "$app"
+          cp build-release/bootloader/bootloader.bin build-release/partition_table/partition-table.bin \
+             build-release/ota_data_initial.bin build-release/flasher_args.json dist/
+          ls -l dist
+          sha=$(sha256sum "$app" | cut -d' ' -f1)
+          size=$(stat -c %s "$app")
+          version=$(python3 -c 'import json; print(json.load(open("build-release/project_description.json"))["project_version"])')
+          subject=$(git log -1 --format=%s "$COMMIT")
+          subject=${subject//|/\\|}   # one table cell
+          echo "sha256=$sha" >> "$GITHUB_OUTPUT"
+          {
+            echo "### $TAG built, waiting for the \`release\` approval"
+            echo
+            echo "Check before approving: the tag and the commit are the ones you released (private"
+            echo "repository: \`git rev-parse $TAG^{commit}\`), the version equals the tag."
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Tag | \`$TAG\` |"
+            echo "| Commit (private main) | \`$COMMIT\` |"
+            echo "| Subject | $subject |"
+            echo "| Built version | \`$version\` |"
+            echo "| Unsigned app | \`$(basename "$app")\`, $size bytes |"
+            echo "| SHA-256 (unsigned) | \`$sha\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: unsigned
+          path: dist/
+          # The approval may come days later; a run approved after this has to be started again.
+          retention-days: 14
+          if-no-files-found: error
+
+  sign:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment: release
+    permissions:
+      contents: read   # checkout of this repository
+    env:
+      UNSIGNED_SHA256: ${{ needs.build.outputs.unsigned_sha256 }}
+    steps:
+      - name: Validate the inputs
+        shell: bash
+        run: |
+          [[ "$TAG" =~ ^v[0-9]{1,5}\.[0-9]{1,5}\.[0-9]{1,5}(-rc\.[0-9]{1,5})?$ ]] || { echo "::error::bad tag"; exit 1; }
+          [[ "$UNSIGNED_SHA256" =~ ^[0-9a-f]{64}$ ]] || { echo "::error::no SHA-256 from the build job"; exit 1; }
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: esptool (exact versions, every file hash-checked)
+        shell: bash
+        run: |
+          # esptool is published as an sdist only: build it without build isolation, from a setuptools
+          # that is itself hash-pinned, so no unpinned package is ever installed.
+          python -m pip install --disable-pip-version-check --require-hashes --no-deps \
+            -r .github/requirements/build.txt
+          python -m pip install --disable-pip-version-check --require-hashes --no-build-isolation \
+            -r .github/requirements/esptool.txt
+          python -m espsecure --help > /dev/null
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: unsigned
+          path: ${{ runner.temp }}/unsigned
+
+      - name: The artifact is the image the build job measured
+        shell: bash
+        run: |
+          echo "$UNSIGNED_SHA256  $RUNNER_TEMP/unsigned/m5dial-kitchen-timer-$APP_ID-$TAG-unsigned.bin" | sha256sum -c -
+
+      - name: Sign (key in a 0600 temporary file, removed in every case)
+        shell: bash
+        env:
+          SIGNING_KEY_PEM: ${{ secrets.SIGNING_KEY_PEM }}
+        run: |
+          umask 077
+          key=$(mktemp "$RUNNER_TEMP/signing.XXXXXX")
+          trap 'shred -u "$key" 2> /dev/null || rm -f "$key"' EXIT
+          printf '%s\n' "$SIGNING_KEY_PEM" > "$key"
+          mkdir -p "$RUNNER_TEMP/signed"
+          python -m espsecure sign-data --version 2 --keyfile "$key" \
+            --output "$RUNNER_TEMP/signed/m5dial-kitchen-timer-$APP_ID-$TAG.bin" \
+            "$RUNNER_TEMP/unsigned/m5dial-kitchen-timer-$APP_ID-$TAG-unsigned.bin"
+
+      - name: Verify with the committed public key
+        shell: bash
+        run: |
+          signed="$RUNNER_TEMP/signed/m5dial-kitchen-timer-$APP_ID-$TAG.bin"
+          python -m espsecure verify-signature --version 2 --keyfile keys/signing_pubkey.pem "$signed"
+          echo "Signed $TAG: $(sha256sum "$signed" | cut -d' ' -f1)" >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: signed
+          path: ${{ runner.temp }}/signed/
+          retention-days: 1
+          if-no-files-found: error
+
+  publish:
+    needs: [build, sign]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write   # create the release and its assets in this repository
+    env:
+      FINAL: ${{ needs.build.outputs.final }}
+      UNSIGNED_SHA256: ${{ needs.build.outputs.unsigned_sha256 }}
+    steps:
+      - name: Validate the inputs
+        shell: bash
+        run: |
+          [[ "$TAG" =~ ^v[0-9]{1,5}\.[0-9]{1,5}\.[0-9]{1,5}(-rc\.[0-9]{1,5})?$ ]] || { echo "::error::bad tag"; exit 1; }
+          if [ -n "$MIN_VERSION" ] && ! [[ "$MIN_VERSION" =~ ^v[0-9]{1,5}\.[0-9]{1,5}\.[0-9]{1,5}$ ]]; then
+            echo "::error::bad min_version"
+            exit 1
+          fi
+          [[ "$UNSIGNED_SHA256" =~ ^[0-9a-f]{64}$ ]] || { echo "::error::no SHA-256 from the build job"; exit 1; }
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: esptool (exact versions, every file hash-checked)
+        shell: bash
+        run: |
+          python -m pip install --disable-pip-version-check --require-hashes --no-deps \
+            -r .github/requirements/build.txt
+          python -m pip install --disable-pip-version-check --require-hashes --no-build-isolation \
+            -r .github/requirements/esptool.txt
+          python -m espsecure --help > /dev/null
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: unsigned
+          path: ${{ runner.temp }}/unsigned
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: signed
+          path: ${{ runner.temp }}/signed
+
+      - name: The signed image is the measured one, signed with the project key
+        shell: bash
+        run: |
+          unsigned="$RUNNER_TEMP/unsigned/m5dial-kitchen-timer-$APP_ID-$TAG-unsigned.bin"
+          signed="$RUNNER_TEMP/signed/m5dial-kitchen-timer-$APP_ID-$TAG.bin"
+          echo "$UNSIGNED_SHA256  $unsigned" | sha256sum -c -
+          python -m espsecure verify-signature --version 2 --keyfile keys/signing_pubkey.pem "$signed"
+          # espsecure sign-data only pads the image to 4 KB and appends one 4 KB signature sector:
+          # the signed file must start with the unsigned image, byte for byte.
+          n=$(stat -c %s "$unsigned")
+          cmp -n "$n" "$unsigned" "$signed"
+          test "$(stat -c %s "$signed")" -eq $(( (n + 4095) / 4096 * 4096 + 4096 ))
+
+      - name: Manifests, SHA256SUMS and web installer files (vendored tools/ of this repository)
+        shell: bash
+        run: |
+          extra=()
+          if [ -n "$MIN_VERSION" ]; then extra=(--min-version "$MIN_VERSION"); fi
+          in=$RUNNER_TEMP/unsigned
+          python tools/make_manifests.py --tag "$TAG" --app "$APP_ID" \
+            --app-bin "$RUNNER_TEMP/signed/m5dial-kitchen-timer-$APP_ID-$TAG.bin" \
+            --flasher-args "$in/flasher_args.json" --parts-dir "$in" --repo "$GITHUB_REPOSITORY" \
+            --notes "$in/notes.md" --out "$RUNNER_TEMP/out" "${extra[@]}"
+          cat "$RUNNER_TEMP/out/manifest.json"
+          cat "$RUNNER_TEMP/out/SHA256SUMS"
+
+      - name: Public release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          out=$RUNNER_TEMP/out
+          # Devices read releases/latest: only a final tag may become "latest", never a candidate.
+          if [ "$FINAL" = true ]; then kind=(--latest); else kind=(--prerelease --latest=false); fi
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --title "$TAG" "${kind[@]}" \
+            --notes-file "$RUNNER_TEMP/unsigned/notes.md" \
+            "$out/m5dial-kitchen-timer-$APP_ID-$TAG.bin" "$out/manifest.json" "$out/SHA256SUMS" \
+            "$out/bootloader.bin" "$out/partition-table.bin" "$out/ota_data_initial.bin"
+          {
+            echo "### $TAG published"
+            echo '```'
+            cat "$out/SHA256SUMS"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Keep the web installer files for the pages job (final tags only)
+        if: env.FINAL == 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: webinstall
+          path: ${{ runner.temp }}/out/webinstall/
+          retention-days: 1
+          if-no-files-found: error
+
+  pages:
+    needs: [build, publish]
+    if: needs.build.outputs.final == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    permissions:
+      contents: read    # checkout, release SHA256SUMS
+      pages: write      # deploy
+      id-token: write   # OIDC proof required by deploy-pages
+    steps:
+      - name: Validate the inputs
+        shell: bash
+        run: |
+          [[ "$TAG" =~ ^v[0-9]{1,5}\.[0-9]{1,5}\.[0-9]{1,5}$ ]] || { echo "::error::bad tag"; exit 1; }
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: esptool (exact versions, every file hash-checked)
+        shell: bash
+        run: |
+          python -m pip install --disable-pip-version-check --require-hashes --no-deps \
+            -r .github/requirements/build.txt
+          python -m pip install --disable-pip-version-check --require-hashes --no-build-isolation \
+            -r .github/requirements/esptool.txt
+          python -m espsecure --help > /dev/null
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: webinstall
+          path: ${{ runner.temp }}/webinstall
+
+      - name: The installer installs the published, signed application
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          asset="m5dial-kitchen-timer-$APP_ID-$TAG.bin"
+          part="$RUNNER_TEMP/webinstall/firmware/$TAG/$asset"
+          python -m espsecure verify-signature --version 2 --keyfile keys/signing_pubkey.pem "$part"
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern SHA256SUMS --dir "$RUNNER_TEMP/release"
+          expected=$(awk -v f="$asset" '$2 == f { print $1 }' "$RUNNER_TEMP/release/SHA256SUMS")
+          [[ "$expected" =~ ^[0-9a-f]{64}$ ]] || { echo "::error::$asset missing from the release SHA256SUMS"; exit 1; }
+          echo "$expected  $part" | sha256sum -c -
+
+      - name: Assemble the site
+        shell: bash
+        run: |
+          # Firmware parts are copied into the site: release assets are served without CORS headers,
+          # so the page could not fetch them from GitHub releases.
+          site=$RUNNER_TEMP/site
+          mkdir -p "$site"
+          cp -R site/. "$site/"
+          cp -R "$RUNNER_TEMP/webinstall/." "$site/"
+          (cd "$site/vendor/esp-web-tools" && for d in */; do (cd "$d" && sha256sum -c --quiet SHA256SUMS); done)
+          find "$site" -type f | sort
+
+      - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        with:
+          path: ${{ runner.temp }}/site
+
+      - id: deploy
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1

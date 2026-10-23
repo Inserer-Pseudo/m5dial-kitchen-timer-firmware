@@ -1,0 +1,6 @@
+# Vendored ESP Web Tools: byte-identical to the npm package, checked against its SHA256SUMS by the
+# pages job. Never convert line endings.
+site/vendor/** -text
+# Licence texts are verbatim upstream copies.
+LICENSES/** -text
+*.pem text eol=lf

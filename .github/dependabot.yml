@@ -1,0 +1,10 @@
+# Monthly pull requests for the actions pinned by SHA in .github/workflows (the version comments are
+# updated with them). Each one goes through the main ruleset: review it (release at least two weeks
+# old, changelog), then merge by hand.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 5

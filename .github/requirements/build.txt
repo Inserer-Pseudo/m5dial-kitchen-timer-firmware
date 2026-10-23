@@ -1,0 +1,6 @@
+# Build backend of esptool's sdist, installed first: pip install --require-hashes --no-deps -r build.txt
+# Every published file of the pinned version is listed (PyPI metadata, 2026-10-23).
+# Update together with esptool.txt (MAINTAINERS.md).
+setuptools==84.0.0 \
+    --hash=sha256:51a52592b3b99e102b609654876bd65f19f999935166d1352678931132b0c670 \
+    --hash=sha256:f4695c21257f0d9b537ec2692c941d02ee143b7cc1276941349a546573b2ef73

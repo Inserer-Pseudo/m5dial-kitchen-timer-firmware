@@ -1,0 +1,60 @@
+M5Dial Kitchen Timer firmware - Binary Licence
+
+Copyright (c) 2026 Benjamin Cherouge — All rights reserved.
+
+This repository distributes the firmware of the "Minuteur M5Dial" kitchen timer in binary form only
+(the "Firmware": the signed application images, bootloader, partition table and OTA data files
+published in this repository's releases and on its web installer), together with the files used to
+publish it. The source code of the Firmware is not published.
+
+1. Grant. Subject to the terms below, you may, free of charge, download the Firmware and install it,
+   with the provided web installer, its over-the-air update function or any other means, on M5Stack
+   Dial devices that you own or lawfully control, and use it on those devices for your personal,
+   non-commercial purposes.
+
+2. Restrictions. Except as expressly permitted by this licence or by applicable law, you may not:
+   (a) redistribute, publish, sell, rent, lend or otherwise make the Firmware available to third
+       parties, in whole or in part, including by hosting copies of it or by pre-installing it on
+       devices you sell or give away; share a link to this repository or to its web installer instead;
+   (b) modify, adapt, translate or create derivative works of the Firmware, or remove or alter its
+       signature;
+   (c) reverse engineer, decompile or disassemble the Firmware, except to the extent that applicable
+       law expressly permits it notwithstanding this limitation (in particular for interoperability);
+   (d) remove or alter any copyright notice or licence information.
+
+3. Third-party components. The Firmware and the web installer contain components published by third
+   parties under their own open-source licences, listed in THIRD_PARTY_NOTICES.md with their full
+   texts in the LICENSES directory. Nothing in this licence restricts the rights you have under those
+   licences for those components.
+
+4. Ownership. The Firmware is licensed, not sold. All rights not expressly granted are reserved by the
+   copyright holder.
+
+5. No warranty. THE FIRMWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED,
+   INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE
+   AND NON-INFRINGEMENT. Installing firmware on a device carries risks: you do so at your own risk.
+   A kitchen timer must not be relied upon where a missed alarm could cause harm.
+
+6. Limitation of liability. TO THE MAXIMUM EXTENT PERMITTED BY APPLICABLE LAW, IN NO EVENT SHALL THE
+   COPYRIGHT HOLDER BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF
+   CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE FIRMWARE OR ITS USE.
+
+7. Termination. This licence ends automatically if you breach it; you must then delete the Firmware
+   from your devices and storage.
+
+8. Governing law. This licence is governed by French law.
+
+---
+
+Résumé en français (le texte anglais ci-dessus fait foi)
+
+Copyright (c) 2026 Benjamin Cherouge — Tous droits réservés.
+
+- Vous pouvez télécharger gratuitement le firmware et l'installer sur les M5Stack Dial qui vous
+  appartiennent, pour un usage personnel et non commercial.
+- Vous ne pouvez pas le redistribuer (partagez plutôt le lien vers ce dépôt ou vers l'installateur
+  web), le modifier, retirer sa signature, ni le décompiler hors des cas autorisés par la loi.
+- Les composants tiers inclus restent sous leurs propres licences libres (THIRD_PARTY_NOTICES.md et
+  dossier LICENSES).
+- Le firmware est fourni « en l'état », sans garantie ; son installation se fait à vos risques.
+- Droit applicable : droit français.
